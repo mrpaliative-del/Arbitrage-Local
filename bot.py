@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -53,7 +52,7 @@ BOOKMAKER_HOME_URLS = {
     "Betway": "https://www.betway.com.ng/",
 }
 
-# These are candidate public endpoints, not guaranteed stable APIs.
+# Candidate public endpoints
 SPORTYBET_FEED_URL = (
     "https://www.sportybet.com.ng/api/kes/factsCentre/"
     "pc/getUpcomingEvents?sport=football&today_only=true"
@@ -62,9 +61,6 @@ BET9JA_FEED_URL = (
     "https://sports.bet9ja.com/desktop/feapi/mobile/"
     "getprematchevents"
 )
-
-# No verified live odds endpoint is configured for these two sources.
-# Do not replace these with made-up odds or sample fixtures.
 
 
 # ============================================================
@@ -96,10 +92,6 @@ def normalize_name(value):
 
 
 def bookmaker_deep_link(bookmaker, match_name):
-    """
-    Return a navigation URL. This is not guaranteed to be a direct
-    event URL and does not prove that the bookmaker's odds are live.
-    """
     query = quote_plus(
         str(match_name)
         .replace(" vs ", " ")
@@ -138,7 +130,6 @@ def event_team_names(event):
         or event.get("A")
     )
 
-    # Some APIs wrap team names in objects.
     if isinstance(home, dict):
         home = (
             home.get("name")
@@ -165,7 +156,6 @@ def event_team_names(event):
 
 
 def event_start_time(event):
-    """Return a source-provided event time, if recognizable."""
     for key in (
         "startTime", "start_time", "kickoff", "kickoffTime",
         "eventTime", "開始時間", "date"
@@ -177,7 +167,6 @@ def event_start_time(event):
 
 
 def extract_outcome_label(value):
-    """Map explicit 1X2 labels to the engine's canonical names."""
     if not isinstance(value, str):
         return None
 
@@ -204,7 +193,6 @@ def extract_outcome_label(value):
 
 
 def extract_price_from_selection(selection):
-    """Read prices only from explicit, recognizable price fields."""
     if isinstance(selection, (int, float, str)):
         return parse_price(selection)
 
@@ -223,10 +211,6 @@ def extract_price_from_selection(selection):
 
 
 def extract_from_explicit_1x2_dict(candidate):
-    """
-    Accept a direct outcome-to-price dictionary such as:
-    {"Home": 2.1, "Draw": 3.2, "Away": 3.5}
-    """
     if not isinstance(candidate, dict):
         return {}
 
@@ -243,11 +227,6 @@ def extract_from_explicit_1x2_dict(candidate):
 
 
 def extract_from_market_list(markets):
-    """
-    Parse markets only when their name explicitly identifies a
-    match-result / 1X2 market and all three outcomes are recognized.
-    Unknown market schemas are skipped.
-    """
     if not isinstance(markets, list):
         return {}
 
@@ -318,10 +297,6 @@ def extract_from_market_list(markets):
 
 
 def extract_1x2_odds(event):
-    """
-    Conservative parser: recognize explicit 1X2 fields or named
-    match-result markets. Never infer missing odds from other markets.
-    """
     if not isinstance(event, dict):
         return {}
 
@@ -339,10 +314,6 @@ def extract_1x2_odds(event):
 
 
 def find_event_lists(payload):
-    """
-    Find event lists in common response wrappers without assuming
-    that any arbitrary list is a list of fixtures.
-    """
     if not isinstance(payload, dict):
         return []
 
@@ -520,16 +491,10 @@ async def fetch_bet9ja_feed(client):
 
 
 async def fetch_1xbet_feed(client):
-    logger.warning(
-        "1xBet: no verified odds endpoint is configured; skipped."
-    )
     return []
 
 
 async def fetch_betway_feed(client):
-    logger.warning(
-        "Betway: no verified odds endpoint is configured; skipped."
-    )
     return []
 
 
@@ -538,11 +503,6 @@ async def fetch_betway_feed(client):
 # ============================================================
 
 def same_fixture(a, b):
-    """
-    Require the same home/away orientation and sufficiently similar
-    team names. If both sources provide kickoff times, reject a clear
-    mismatch. Team similarity alone is not proof of event identity.
-    """
     home_score = fuzz.token_sort_ratio(
         normalize_name(a["home_team"]),
         normalize_name(b["home_team"]),
@@ -561,8 +521,6 @@ def same_fixture(a, b):
     time_a = a.get("start_time")
     time_b = b.get("start_time")
 
-    # When the formats differ, don't pretend we have verified timing.
-    # Only reject times when both parse cleanly as ISO timestamps.
     if time_a and time_b:
         try:
             dt_a = datetime.fromisoformat(
@@ -587,7 +545,6 @@ def same_fixture(a, b):
 
 
 def group_fixtures(fixtures):
-    """Build event groups from the records actually retrieved."""
     groups = []
 
     for fixture in fixtures:
@@ -601,7 +558,6 @@ def group_fixtures(fixtures):
         if matched_group is None:
             groups.append([fixture])
         else:
-            # Keep only one record per bookmaker in a group.
             existing = {
                 item["bookmaker"] for item in matched_group
             }
@@ -616,15 +572,10 @@ def group_fixtures(fixtures):
 # ============================================================
 
 def round_stake_down(value, base):
-    """Round down so rounding does not exceed the bankroll."""
     return int(math.floor(max(0, value) / base) * base)
 
 
 def evaluate_fixture_group(group, bankroll):
-    """
-    Select the best available price for Home, Draw and Away across
-    all retrieved bookmakers, then test the 1X2 arbitrage condition.
-    """
     if bankroll <= 0:
         return None
 
@@ -658,7 +609,6 @@ def evaluate_fixture_group(group, bankroll):
         for outcome in ("Home", "Draw", "Away")
     )
 
-    # Strict condition: theoretical 1X2 arbitrage exists only if S < 1.
     if implied_sum >= 1.0:
         return None
 
@@ -693,8 +643,6 @@ def evaluate_fixture_group(group, bankroll):
         min_gross_return - total_staked, 2
     )
 
-    # Rounding may destroy the margin. Reject it if the actual
-    # rounded stake plan does not remain profitable in all outcomes.
     if actual_worst_case_profit <= 0:
         return None
 
@@ -816,7 +764,6 @@ async def scan_loop():
             )
             current_signatures.add(signature)
 
-            # Avoid repeatedly sending the same candidate every 15 minutes.
             if signature in last_alert_signatures:
                 continue
 
@@ -858,8 +805,6 @@ async def scan_loop():
 
             await send_telegram_notification("\n".join(lines))
 
-        # Keep only currently detected opportunities. If one disappears
-        # and later returns, it can trigger a new notification.
         last_alert_signatures = current_signatures
 
         return {
@@ -934,7 +879,7 @@ async def shutdown_event():
 # HEALTH AND MANUAL TEST ENDPOINTS
 # ============================================================
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
     return {
         "status": "online",
@@ -944,15 +889,8 @@ async def health_check():
         ),
         "bankroll": TOTAL_BANKROLL,
         "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
-        "bookmakers": {
-            "SportyBet": "candidate feed configured; live odds unverified",
-            "Bet9ja": "candidate feed configured; live odds unverified",
-            "1xBet": "not configured",
-            "Betway": "not configured",
-        },
         "note": (
-            "Online status does not prove that feeds return usable odds. "
-            "A candidate is not a guaranteed or risk-free profit."
+            "Service health does not confirm bookmaker feed availability."
         ),
     }
 
@@ -982,8 +920,6 @@ async def scan_now():
             detail="A scan is already running.",
         )
 
-    # Return the scan result so the caller can see whether fixtures
-    # were actually found instead of receiving an unconditional success.
     return await scan_loop()
 
 
