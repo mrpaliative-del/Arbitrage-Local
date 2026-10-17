@@ -1,4 +1,3 @@
-
 import os
 import re
 import time
@@ -46,50 +45,49 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Existing feeds. Their continued availability is not guaranteed.
+# Existing feed endpoints. Their continued availability is not guaranteed.
 SPORTYBET_URL = (
     "https://www.sportybet.com.ng/api/kes/factsCentre/"
     "pc/getUpcomingEvents"
 )
-BET9JA_URL = (
-    "https://sports.bet9ja.com/desktop/feapi/mobile/"
-    "getprematchevents"
-)
 
-# Browser page URLs are configurable because country routes can change.
+# ============================================================
+# Public Page Candidates & Browser Sources Configuration
+# ============================================================
+
 XBET_PAGE_URL = os.getenv(
     "XBET_PAGE_URL",
     "https://1xbet.ng/en/line/football",
 ).strip()
 
-BETWAY_PAGE_URL = os.getenv(
-    "BETWAY_PAGE_URL",
-    "https://www.betway.com.ng/",
+BET9JA_PAGE_URL = os.getenv(
+    "BET9JA_PAGE_URL",
+    "https://sports.bet9ja.com/?lang=en",
 ).strip()
 
-# CSS selectors must be verified against each current public page.
-# Empty selectors deliberately disable browser collection for that source.
+BETWAY_PAGE_URL = os.getenv(
+    "BETWAY_PAGE_URL",
+    "https://beta.betway.com.ng/sport/soccer/ltu",
+).strip()
+
+
+def browser_source(prefix, url):
+    return {
+        "url": url,
+        "event": os.getenv(f"{prefix}_EVENT_SELECTOR", "").strip(),
+        "home": os.getenv(f"{prefix}_HOME_SELECTOR", "").strip(),
+        "away": os.getenv(f"{prefix}_AWAY_SELECTOR", "").strip(),
+        "home_odds": os.getenv(f"{prefix}_HOME_ODDS_SELECTOR", "").strip(),
+        "draw_odds": os.getenv(f"{prefix}_DRAW_ODDS_SELECTOR", "").strip(),
+        "away_odds": os.getenv(f"{prefix}_AWAY_ODDS_SELECTOR", "").strip(),
+        "league": os.getenv(f"{prefix}_LEAGUE_SELECTOR", "").strip(),
+    }
+
+
 BROWSER_SOURCES = {
-    "1xBet": {
-        "url": XBET_PAGE_URL,
-        "event": os.getenv("XBET_EVENT_SELECTOR", "").strip(),
-        "home": os.getenv("XBET_HOME_SELECTOR", "").strip(),
-        "away": os.getenv("XBET_AWAY_SELECTOR", "").strip(),
-        "home_odds": os.getenv("XBET_HOME_ODDS_SELECTOR", "").strip(),
-        "draw_odds": os.getenv("XBET_DRAW_ODDS_SELECTOR", "").strip(),
-        "away_odds": os.getenv("XBET_AWAY_ODDS_SELECTOR", "").strip(),
-        "league": os.getenv("XBET_LEAGUE_SELECTOR", "").strip(),
-    },
-    "Betway": {
-        "url": BETWAY_PAGE_URL,
-        "event": os.getenv("BETWAY_EVENT_SELECTOR", "").strip(),
-        "home": os.getenv("BETWAY_HOME_SELECTOR", "").strip(),
-        "away": os.getenv("BETWAY_AWAY_SELECTOR", "").strip(),
-        "home_odds": os.getenv("BETWAY_HOME_ODDS_SELECTOR", "").strip(),
-        "draw_odds": os.getenv("BETWAY_DRAW_ODDS_SELECTOR", "").strip(),
-        "away_odds": os.getenv("BETWAY_AWAY_ODDS_SELECTOR", "").strip(),
-        "league": os.getenv("BETWAY_LEAGUE_SELECTOR", "").strip(),
-    },
+    "1xBet": browser_source("XBET", XBET_PAGE_URL),
+    "Bet9ja": browser_source("BET9JA", BET9JA_PAGE_URL),
+    "Betway": browser_source("BETWAY", BETWAY_PAGE_URL),
 }
 
 HEADERS = {
@@ -195,15 +193,6 @@ def make_fixture(bookmaker, home, away, odds, league="", kickoff=None,
         return None
 
     return fixture
-
-
-def first_value(obj, keys):
-    if not isinstance(obj, dict):
-        return None
-    for key in keys:
-        if obj.get(key) not in (None, ""):
-            return obj[key]
-    return None
 
 
 # -------------------- SportyBet adapter --------------------
@@ -336,114 +325,12 @@ async def fetch_sportybet(client):
         return [], f"NETWORK_ERROR: {type(exc).__name__}"
 
 
-# -------------------- Bet9ja adapter --------------------
-
-def walk_dicts(obj):
-    if isinstance(obj, dict):
-        yield obj
-        for value in obj.values():
-            if isinstance(value, (dict, list)):
-                yield from walk_dicts(value)
-    elif isinstance(obj, list):
-        for value in obj:
-            if isinstance(value, (dict, list)):
-                yield from walk_dicts(value)
-
-
-def parse_bet9ja(payload):
-    fixtures = []
-    if not isinstance(payload, (dict, list)):
-        return fixtures
-
-    for item in walk_dicts(payload):
-        home = first_value(item, [
-            "homeTeamName", "homeTeam", "homeName", "home_team"
-        ])
-        away = first_value(item, [
-            "awayTeamName", "awayTeam", "awayName", "away_team"
-        ])
-
-        # Accept only explicit, recognizable 1X2 fields.
-        odds = {
-            "home": number(first_value(item, ["homeOdds", "oddsHome", "home_odds"])),
-            "draw": number(first_value(item, ["drawOdds", "oddsDraw", "draw_odds"])),
-            "away": number(first_value(item, ["awayOdds", "oddsAway", "away_odds"])),
-        }
-
-        nested = item.get("odds")
-        if isinstance(nested, dict):
-            odds = {
-                "home": number(first_value(nested, ["home", "1", "H"])),
-                "draw": number(first_value(nested, ["draw", "x", "X"])),
-                "away": number(first_value(nested, ["away", "2", "A"])),
-            }
-
-        fixture = make_fixture(
-            "Bet9ja",
-            home,
-            away,
-            odds,
-            league=item.get("league", ""),
-            kickoff=first_value(item, [
-                "startTime", "start_time", "kickoff", "eventTime"
-            ]),
-            source_id=first_value(item, ["matchId", "eventId", "id"]),
-        )
-        if fixture:
-            fixtures.append(fixture)
-
-    # Remove duplicate records.
-    unique = {}
-    for fixture in fixtures:
-        key = (
-            clean_name(fixture["home"]),
-            clean_name(fixture["away"]),
-            fixture["source_id"],
-        )
-        unique[key] = fixture
-    return list(unique.values())
-
-
-async def fetch_bet9ja(client):
-    try:
-        response = await client.get(
-            BET9JA_URL,
-            headers={
-                **HEADERS,
-                "Referer": "https://sports.bet9ja.com/",
-            },
-            follow_redirects=False,
-        )
-
-        if response.status_code != 200:
-            return [], f"HTTP {response.status_code}"
-
-        try:
-            payload = response.json()
-        except ValueError:
-            return [], "PARSER_FAILED: invalid JSON"
-
-        fixtures = parse_bet9ja(payload)
-        return (
-            fixtures,
-            "OK" if fixtures else "PARSER_FAILED: no recognized 1X2 fixtures",
-        )
-
-    except httpx.TimeoutException:
-        return [], "TIMEOUT"
-    except httpx.HTTPError as exc:
-        return [], f"NETWORK_ERROR: {type(exc).__name__}"
-
-
-# -------------------- Optional browser-based odds collection --------------------
+# -------------------- Browser-based odds collection --------------------
 
 async def fetch_browser_bookmaker(name, config):
     """
     Reads publicly rendered event cards using user-verified CSS selectors.
-
     No CAPTCHA bypass, login bypass, or anti-bot circumvention.
-    Selectors are intentionally not guessed. Missing selectors mean
-    UNCONFIGURED rather than fabricated odds.
     """
     required = [
         "event", "home", "away",
@@ -481,8 +368,6 @@ async def fetch_browser_bookmaker(name, config):
                 await browser.close()
                 return [], status
 
-            # Wait briefly for ordinary page rendering, without trying
-            # to defeat bot protection or restricted access.
             await page.wait_for_timeout(1500)
 
             cards = page.locator(config["event"])
@@ -519,8 +404,6 @@ async def fetch_browser_bookmaker(name, config):
                     league=league or "",
                 )
                 if fixture:
-                    # Browser capture time is known, but bookmaker
-                    # price-update time is not. It is marked separately.
                     fixture["price_updated_at"] = None
                     fixture["source"] = "browser"
                     fixtures.append(fixture)
@@ -538,7 +421,6 @@ async def fetch_browser_bookmaker(name, config):
         )
 
     except Exception as exc:
-        # Do not expose page content, credentials, or full URLs in logs.
         return [], f"BROWSER_ERROR: {type(exc).__name__}"
 
 
@@ -548,6 +430,7 @@ async def fetch_all_feeds(client):
     fixtures = []
     statuses = {}
 
+    # SportyBet API Adapter
     sporty, status = await fetch_sportybet(client)
     fixtures.extend(sporty)
     statuses["SportyBet"] = {
@@ -555,20 +438,16 @@ async def fetch_all_feeds(client):
         "fixtures": len(sporty),
     }
 
-    bet9ja, status = await fetch_bet9ja(client)
-    fixtures.extend(bet9ja)
-    statuses["Bet9ja"] = {
-        "status": status,
-        "fixtures": len(bet9ja),
-    }
-
+    # Browser-rendered pages for 1xBet, Bet9ja, and Betway
     for name, config in BROWSER_SOURCES.items():
         found, status = await fetch_browser_bookmaker(name, config)
         fixtures.extend(found)
+
         statuses[name] = {
             "status": status,
             "fixtures": len(found),
         }
+
         await asyncio.sleep(0.5)
 
     return fixtures, statuses
@@ -577,7 +456,6 @@ async def fetch_all_feeds(client):
 # -------------------- Fixture matching and calculations --------------------
 
 def same_fixture(a, b):
-    # A reversed home/away fixture is not the same 1X2 market.
     same_teams = (
         names_match(a["home"], b["home"])
         and names_match(a["away"], b["away"])
@@ -595,7 +473,6 @@ def same_fixture(a, b):
 def price_is_fresh(event):
     updated = event.get("price_updated_at")
     if updated is None:
-        # Browser-rendered odds do not expose a verified update timestamp.
         return event.get("source") != "browser"
 
     age = time.time() - updated
@@ -625,7 +502,6 @@ def evaluate_group(group):
     if len({x["bookmaker"] for x in group}) < 2:
         return None
 
-    # Reject stale or timestamp-unverified browser prices.
     usable = [x for x in group if price_is_fresh(x)]
     if len({x["bookmaker"] for x in usable}) < 2:
         return None
@@ -751,7 +627,7 @@ def build_recommendations():
     if not PLAYWRIGHT_AVAILABLE:
         recommendations.append(
             "Browser mode is disabled. Install Playwright and Chromium "
-            "before configuring 1xBet or Betway page selectors."
+            "before configuring browser source page selectors."
         )
 
     if not recommendations:
@@ -923,7 +799,7 @@ async def lifespan(app):
 
 app = FastAPI(
     title="SolveEase Arbitrage Engine",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
