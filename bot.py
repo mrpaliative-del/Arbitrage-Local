@@ -1,15 +1,21 @@
 import os
 import asyncio
+import threading
 import httpx
+from fastapi import FastAPI
+import uvicorn
 from thefuzz import fuzz
 
 # --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TOTAL_BANKROLL = 100000.0  # ₦100,000 NGN Bankroll
-ROUND_NEAREST = 500        # Anti-ban rounding increment (₦500 blocks)
-SIMILARITY_THRESHOLD = 85  # Minimum fuzzy match score to pair team names
+TOTAL_BANKROLL = float(os.getenv("TOTAL_BANKROLL", "100000.0"))  # Default: ₦100,000 NGN
+ROUND_NEAREST = int(os.getenv("ROUND_NEAREST", "500"))          # Default: Anti-ban ₦500 blocks
+SIMILARITY_THRESHOLD = 85                                       # Minimum fuzzy match score
 
+app = FastAPI(title="SportyBet & Bet9ja Arbitrage Engine")
+
+# --- UTILITIES & ARBITRAGE MATH ---
 def round_to_nearest(val, base=500):
     return int(base * round(val / base))
 
@@ -123,23 +129,26 @@ def match_fixtures_and_evaluate(sportybet_fixtures, bet9ja_fixtures, bankroll):
 
 async def send_telegram_notification(alert_text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials missing.")
+        print("[Telegram Alert Skipped]: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": alert_text, "parse_mode": "HTML"}
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json=payload, timeout=10.0)
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(url, json=payload, timeout=10.0)
+    except Exception as e:
+        print(f"[Telegram Post Error]: {e}")
 
 async def scan_loop():
     async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
-        print("[*] Starting automated SportyBet & Bet9ja scan...")
+        print("[*] Executing SportyBet & Bet9ja Arbitrage Scan...")
         
         sb_task = asyncio.create_task(fetch_sportybet_feed(client))
         bj_task = asyncio.create_task(fetch_bet9ja_feed(client))
         
         sportybet_data, bet9ja_data = await asyncio.gather(sb_task, bj_task)
         
-        # Fallback simulation mock data if live endpoints require secure browser cookies
+        # Fallback simulation mock data if endpoints require active browser session cookies
         if not sportybet_data:
             sportybet_data = [{"match": "Remo Stars vs Enyimba", "home_team": "Remo Stars", "away_team": "Enyimba", "odds": {"Home": 2.45, "Draw": 3.30, "Away": 2.90}}]
         if not bet9ja_data:
@@ -163,5 +172,35 @@ async def scan_loop():
             print(msg)
             await send_telegram_notification(msg)
 
+# --- BACKGROUND THREAD & FASTAPI SERVER ---
+async def continuous_scanner():
+    while True:
+        try:
+            await scan_loop()
+        except Exception as e:
+            print(f"[Scanner Loop Exception]: {e}")
+        
+        print("[*] Scan complete. Sleeping for 15 minutes...")
+        await asyncio.sleep(900)  # Wait 15 minutes between scans
+
+def run_background_scanner():
+    asyncio.run(continuous_scanner())
+
+@app.on_event("startup")
+def startup_event():
+    # Spin off the arbitrage loop on a background thread when Render boots the container
+    scanner_thread = threading.Thread(target=run_background_scanner, daemon=True)
+    scanner_thread.start()
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "service": "SportyBet vs Bet9ja Arbitrage Engine",
+        "bankroll": f"₦{TOTAL_BANKROLL:,.2f}",
+        "stake_rounding": f"₦{ROUND_NEAREST}"
+    }
+
 if __name__ == "__main__":
-    asyncio.run(scan_loop())
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
