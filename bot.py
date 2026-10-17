@@ -11,51 +11,85 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException
 
+# Optional browser engine. Install Playwright and Chromium to enable it.
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    async_playwright = None
+    PLAYWRIGHT_AVAILABLE = False
+
+
 # ============================================================
 # SolveEase Arbitrage Engine
-# Render command:
-# uvicorn bot:app --host 0.0.0.0 --port $PORT
-#
-# Analysis and Telegram alerts only. Never places bets.
+# Free-source-first, analysis and Telegram alerts only.
+# Does not place bets or bypass website access controls.
 # ============================================================
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
-# Prevent httpx from logging full request URLs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log = logging.getLogger("arbitrage_engine")
 
 BANKROLL = float(os.getenv("BANKROLL_NGN", "100000"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
-MIN_PROFIT_NGN = float(os.getenv("MIN_PROFIT_NGN", "100"))
-MIN_MARGIN_PERCENT = float(os.getenv("MIN_MARGIN_PERCENT", "0.5"))
-STAKE_STEP = float(os.getenv("STAKE_STEP_NGN", "500"))
+SCAN_INTERVAL = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "900")))
+STAKE_STEP = max(1, float(os.getenv("STAKE_STEP_NGN", "500")))
+MIN_PROFIT = float(os.getenv("MIN_PROFIT_NGN", "100"))
+MIN_MARGIN = float(os.getenv("MIN_MARGIN_PERCENT", "0.5"))
+MAX_PRICE_AGE = int(os.getenv("MAX_PRICE_AGE_SECONDS", "1200"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# Existing feeds. Their continued availability is not guaranteed.
 SPORTYBET_URL = (
-    "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents"
+    "https://www.sportybet.com.ng/api/kes/factsCentre/"
+    "pc/getUpcomingEvents"
 )
-
 BET9JA_URL = (
-    "https://sports.bet9ja.com/desktop/feapi/"
-    "PalimpsestAjax/GetEventsInGroupV2"
+    "https://sports.bet9ja.com/desktop/feapi/mobile/"
+    "getprematchevents"
 )
 
-# These group IDs are community-documented examples, not
-# guaranteed current IDs. Failed groups are reported explicitly.
-BET9JA_GROUPS = {
-    "Premier League": "170880",
-    "La Liga": "180928",
-    "Bundesliga": "180923",
-    "Serie A": "167856",
+# Browser page URLs are configurable because country routes can change.
+XBET_PAGE_URL = os.getenv(
+    "XBET_PAGE_URL",
+    "https://1xbet.ng/en/line/football",
+).strip()
+
+BETWAY_PAGE_URL = os.getenv(
+    "BETWAY_PAGE_URL",
+    "https://www.betway.com.ng/",
+).strip()
+
+# CSS selectors must be verified against each current public page.
+# Empty selectors deliberately disable browser collection for that source.
+BROWSER_SOURCES = {
+    "1xBet": {
+        "url": XBET_PAGE_URL,
+        "event": os.getenv("XBET_EVENT_SELECTOR", "").strip(),
+        "home": os.getenv("XBET_HOME_SELECTOR", "").strip(),
+        "away": os.getenv("XBET_AWAY_SELECTOR", "").strip(),
+        "home_odds": os.getenv("XBET_HOME_ODDS_SELECTOR", "").strip(),
+        "draw_odds": os.getenv("XBET_DRAW_ODDS_SELECTOR", "").strip(),
+        "away_odds": os.getenv("XBET_AWAY_ODDS_SELECTOR", "").strip(),
+        "league": os.getenv("XBET_LEAGUE_SELECTOR", "").strip(),
+    },
+    "Betway": {
+        "url": BETWAY_PAGE_URL,
+        "event": os.getenv("BETWAY_EVENT_SELECTOR", "").strip(),
+        "home": os.getenv("BETWAY_HOME_SELECTOR", "").strip(),
+        "away": os.getenv("BETWAY_AWAY_SELECTOR", "").strip(),
+        "home_odds": os.getenv("BETWAY_HOME_ODDS_SELECTOR", "").strip(),
+        "draw_odds": os.getenv("BETWAY_DRAW_ODDS_SELECTOR", "").strip(),
+        "away_odds": os.getenv("BETWAY_AWAY_ODDS_SELECTOR", "").strip(),
+        "league": os.getenv("BETWAY_LEAGUE_SELECTOR", "").strip(),
+    },
 }
 
 HEADERS = {
@@ -69,6 +103,9 @@ HEADERS = {
 }
 
 scan_lock = asyncio.Lock()
+background_task = None
+sent_alert_keys = set()
+
 last_scan = {
     "started_at": None,
     "completed_at": None,
@@ -77,20 +114,22 @@ last_scan = {
     "feeds": {},
     "error": None,
 }
-sent_alert_keys = set()
 
 
-# -------------------- General helpers --------------------
+# -------------------- Helpers --------------------
 
 def number(value):
-    """Return a positive finite float, or None."""
+    if value is None:
+        return None
     try:
-        result = float(str(value).replace(",", "").strip())
-        if result > 1.0 and result < 10000:
-            return result
-    except (TypeError, ValueError):
-        pass
-    return None
+        text_value = str(value).replace(",", "").strip()
+        match = re.search(r"\d+(?:\.\d+)?", text_value)
+        if not match:
+            return None
+        result = float(match.group())
+        return result if 1.01 <= result < 10000 else None
+    except (ValueError, TypeError):
+        return None
 
 
 def clean_name(value):
@@ -101,15 +140,13 @@ def clean_name(value):
 
 
 def names_match(a, b):
-    a = clean_name(a)
-    b = clean_name(b)
+    a, b = clean_name(a), clean_name(b)
     if not a or not b:
         return False
     return SequenceMatcher(None, a, b).ratio() >= 0.88
 
 
 def parse_timestamp(value):
-    """Convert common timestamp formats to Unix seconds."""
     if value is None:
         return None
     try:
@@ -118,29 +155,21 @@ def parse_timestamp(value):
             stamp /= 1000
         if stamp > 0:
             return stamp
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         pass
-    return None
 
-
-def event_key(event):
-    return (
-        clean_name(event.get("home")),
-        clean_name(event.get("away")),
-    )
-
-
-def valid_fixture(event):
-    return (
-        bool(event.get("home"))
-        and bool(event.get("away"))
-        and event.get("home") != event.get("away")
-        and all(number(event["odds"].get(k)) for k in ("home", "draw", "away"))
-    )
+    try:
+        value = str(value).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 def make_fixture(bookmaker, home, away, odds, league="", kickoff=None,
-                 source_id=None):
+                 source_id=None, price_updated_at=None):
     fixture = {
         "bookmaker": bookmaker,
         "home": str(home or "").strip(),
@@ -154,27 +183,34 @@ def make_fixture(bookmaker, home, away, odds, league="", kickoff=None,
             "away": number(odds.get("away")),
         },
         "observed_at": time.time(),
+        "price_updated_at": parse_timestamp(price_updated_at),
     }
-    return fixture if valid_fixture(fixture) else None
+
+    if (
+        not fixture["home"]
+        or not fixture["away"]
+        or clean_name(fixture["home"]) == clean_name(fixture["away"])
+        or not all(fixture["odds"].get(k) for k in ("home", "draw", "away"))
+    ):
+        return None
+
+    return fixture
 
 
-# -------------------- SportyBet parser --------------------
+def first_value(obj, keys):
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        if obj.get(key) not in (None, ""):
+            return obj[key]
+    return None
+
+
+# -------------------- SportyBet adapter --------------------
 
 def parse_sportybet(payload):
-    """
-    Expected documented structure:
-    data.tournaments[].events[].markets[].outcomes[]
-
-    Market 1 is treated as the standard 1X2 market.
-    Unknown or incomplete market layouts are rejected.
-    """
     fixtures = []
-
     if not isinstance(payload, dict):
-        return fixtures
-
-    if payload.get("bizCode") not in (None, 10000, "10000"):
-        log.warning("SportyBet returned a non-success business code.")
         return fixtures
 
     data = payload.get("data", {})
@@ -189,13 +225,9 @@ def parse_sportybet(payload):
         if not isinstance(tournament, dict):
             continue
 
-        league = (
-            tournament.get("name")
-            or tournament.get("categoryName")
-            or ""
-        )
-
+        league = tournament.get("name", "")
         events = tournament.get("events", [])
+
         if not isinstance(events, list):
             continue
 
@@ -203,7 +235,6 @@ def parse_sportybet(payload):
             if not isinstance(event, dict):
                 continue
 
-            # Skip clearly started/finished events.
             status = str(event.get("matchStatus", "")).lower()
             if status in {"live", "inplay", "finished", "ended"}:
                 continue
@@ -218,22 +249,13 @@ def parse_sportybet(payload):
                 if not isinstance(market, dict):
                     continue
 
+                desc = str(market.get("desc", "")).strip().lower()
                 market_id = str(market.get("id", ""))
-                market_desc = str(market.get("desc", "")).lower()
 
-                # Do not mix handicap or other market types with 1X2.
-                is_1x2 = (
-                    market_id == "1"
-                    or market_desc.strip() in {
-                        "1x2", "match result", "full time result",
-                        "fulltime result",
-                    }
-                )
-                if not is_1x2:
-                    continue
-
-                market_status = str(market.get("status", "")).lower()
-                if market_status in {"0", "closed", "suspended", "inactive"}:
+                if market_id != "1" and desc not in {
+                    "1x2", "match result", "full time result",
+                    "fulltime result",
+                }:
                     continue
 
                 outcomes = market.get("outcomes", [])
@@ -243,27 +265,19 @@ def parse_sportybet(payload):
                 for outcome in outcomes:
                     if not isinstance(outcome, dict):
                         continue
-                    if outcome.get("isActive") is False:
-                        continue
 
-                    outcome_id = str(outcome.get("id", "")).lower()
-                    desc = str(outcome.get("desc", "")).strip().lower()
                     price = number(outcome.get("odds"))
-
                     if not price:
                         continue
 
-                    if outcome_id in {"1", "home"} or desc in {
-                        "1", "home", "home win"
-                    }:
+                    oid = str(outcome.get("id", "")).lower()
+                    name = str(outcome.get("desc", "")).lower()
+
+                    if oid in {"1", "home"} or name in {"1", "home", "home win"}:
                         odds["home"] = price
-                    elif outcome_id in {"2", "draw", "x"} or desc in {
-                        "x", "draw"
-                    }:
+                    elif oid in {"2", "draw", "x"} or name in {"x", "draw"}:
                         odds["draw"] = price
-                    elif outcome_id in {"3", "away"} or desc in {
-                        "2", "away", "away win"
-                    }:
+                    elif oid in {"3", "away"} or name in {"2", "away", "away win"}:
                         odds["away"] = price
 
                 if all(k in odds for k in ("home", "draw", "away")):
@@ -285,178 +299,119 @@ def parse_sportybet(payload):
 
 
 async def fetch_sportybet(client):
-    params = {
-        "sportId": "sr:sport:1",
-        "marketId": "1",
-        "pageSize": "100",
-        "pageNum": "1",
-        "todayGames": "false",
-        "timeline": "168",
-        "_t": str(int(time.time() * 1000)),
-    }
-    headers = {
-        **HEADERS,
-        "Current-Country": "NG",
-        "Content-Type": "application/json",
-        "Referer": "https://www.sportybet.com/ng/",
-    }
-
     try:
         response = await client.get(
             SPORTYBET_URL,
-            params=params,
-            headers=headers,
+            params={
+                "sport": "football",
+                "today_only": "true",
+            },
+            headers={
+                **HEADERS,
+                "Referer": "https://www.sportybet.com/ng/",
+            },
             follow_redirects=False,
         )
 
         if response.status_code != 200:
             return [], f"HTTP {response.status_code}"
 
-        content_type = response.headers.get("content-type", "").lower()
-        if "json" not in content_type:
-            return [], f"Unexpected content type: {content_type or 'unknown'}"
+        if "json" not in response.headers.get("content-type", "").lower():
+            return [], "UNAVAILABLE: response is not JSON"
 
         try:
             payload = response.json()
         except ValueError:
-            return [], "Response was not valid JSON"
+            return [], "PARSER_FAILED: invalid JSON"
 
         fixtures = parse_sportybet(payload)
-        if not fixtures:
-            return [], "Request succeeded but no valid 1X2 fixtures were parsed"
-
-        return fixtures, "OK"
+        return (
+            fixtures,
+            "OK" if fixtures else "PARSER_FAILED: no valid 1X2 fixtures",
+        )
 
     except httpx.TimeoutException:
-        return [], "Request timed out"
+        return [], "TIMEOUT"
     except httpx.HTTPError as exc:
-        return [], f"Network error: {type(exc).__name__}"
+        return [], f"NETWORK_ERROR: {type(exc).__name__}"
 
 
-# -------------------- Bet9ja parser --------------------
+# -------------------- Bet9ja adapter --------------------
 
-def recursive_dicts(obj):
-    """Yield dictionaries nested inside common JSON containers."""
+def walk_dicts(obj):
     if isinstance(obj, dict):
         yield obj
         for value in obj.values():
             if isinstance(value, (dict, list)):
-                yield from recursive_dicts(value)
+                yield from walk_dicts(value)
     elif isinstance(obj, list):
         for value in obj:
             if isinstance(value, (dict, list)):
-                yield from recursive_dicts(value)
+                yield from walk_dicts(value)
 
 
-def first_value(obj, keys):
-    for key in keys:
-        if key in obj and obj[key] not in (None, ""):
-            return obj[key]
-    return None
-
-
-def parse_bet9ja(payload, league):
-    """
-    Supports common flat event fields and nested event objects.
-    If Bet9ja changes its schema, unrecognized objects are rejected.
-    """
+def parse_bet9ja(payload):
     fixtures = []
     if not isinstance(payload, (dict, list)):
         return fixtures
 
-    seen = set()
-
-    for item in recursive_dicts(payload):
+    for item in walk_dicts(payload):
         home = first_value(item, [
-            "homeTeamName", "homeTeam", "homeName", "home_team",
+            "homeTeamName", "homeTeam", "homeName", "home_team"
         ])
         away = first_value(item, [
-            "awayTeamName", "awayTeam", "awayName", "away_team",
+            "awayTeamName", "awayTeam", "awayName", "away_team"
         ])
 
-        # Some community examples use a single "Home - Away" field.
-        match = first_value(item, ["match", "eventName", "fixtureName"])
-        if (not home or not away) and isinstance(match, str):
-            parts = re.split(r"\s+-\s+|\s+vs\.?\s+", match, maxsplit=1,
-                             flags=re.IGNORECASE)
-            if len(parts) == 2:
-                home, away = parts
-
-        odds = {}
-
-        # Common flat field names used by some feeds.
-        home_price = first_value(item, [
-            "homeOdds", "oddsHome", "home_odds", "home",
-        ])
-        draw_price = first_value(item, [
-            "drawOdds", "oddsDraw", "draw_odds", "draw",
-        ])
-        away_price = first_value(item, [
-            "awayOdds", "oddsAway", "away_odds", "away",
-        ])
-
-        # If home/away are objects rather than team names, reject this shape.
-        if isinstance(home, (dict, list)) or isinstance(away, (dict, list)):
-            continue
-
+        # Accept only explicit, recognizable 1X2 fields.
         odds = {
-            "home": number(home_price),
-            "draw": number(draw_price),
-            "away": number(away_price),
+            "home": number(first_value(item, ["homeOdds", "oddsHome", "home_odds"])),
+            "draw": number(first_value(item, ["drawOdds", "oddsDraw", "draw_odds"])),
+            "away": number(first_value(item, ["awayOdds", "oddsAway", "away_odds"])),
         }
 
-        # Alternate outcome dictionary layout.
-        nested_odds = item.get("odds")
-        if isinstance(nested_odds, dict):
+        nested = item.get("odds")
+        if isinstance(nested, dict):
             odds = {
-                "home": number(first_value(nested_odds, ["home", "1", "H"])),
-                "draw": number(first_value(nested_odds, ["draw", "x", "X"])),
-                "away": number(first_value(nested_odds, ["away", "2", "A"])),
+                "home": number(first_value(nested, ["home", "1", "H"])),
+                "draw": number(first_value(nested, ["draw", "x", "X"])),
+                "away": number(first_value(nested, ["away", "2", "A"])),
             }
 
         fixture = make_fixture(
-            "Bet9ja", home, away, odds, league=league,
+            "Bet9ja",
+            home,
+            away,
+            odds,
+            league=item.get("league", ""),
             kickoff=first_value(item, [
-                "time", "startTime", "start_time", "kickoff",
-                "eventTime", "date",
+                "startTime", "start_time", "kickoff", "eventTime"
             ]),
-            source_id=first_value(item, [
-                "match_id", "matchId", "eventId", "id",
-            ]),
+            source_id=first_value(item, ["matchId", "eventId", "id"]),
         )
+        if fixture:
+            fixtures.append(fixture)
 
-        if not fixture:
-            continue
-
+    # Remove duplicate records.
+    unique = {}
+    for fixture in fixtures:
         key = (
             clean_name(fixture["home"]),
             clean_name(fixture["away"]),
-            fixture.get("source_id", ""),
+            fixture["source_id"],
         )
-        if key not in seen:
-            seen.add(key)
-            fixtures.append(fixture)
-
-    return fixtures
+        unique[key] = fixture
+    return list(unique.values())
 
 
-async def fetch_bet9ja_group(client, league, group_id):
-    params = {
-        "GROUPID": group_id,
-        "DISP": "0",
-        "GROUPMARKETID": "1",
-        "matches": "true",
-    }
-    headers = {
-        **HEADERS,
-        "Referer": "https://sports.bet9ja.com/",
-    }
-
+async def fetch_bet9ja(client):
     try:
         response = await client.get(
             BET9JA_URL,
-            params=params,
-            headers=headers,
+            headers={
+                **HEADERS,
+                "Referer": "https://sports.bet9ja.com/",
+            },
             follow_redirects=False,
         )
 
@@ -466,171 +421,265 @@ async def fetch_bet9ja_group(client, league, group_id):
         try:
             payload = response.json()
         except ValueError:
-            return [], "Response was not valid JSON"
+            return [], "PARSER_FAILED: invalid JSON"
 
-        fixtures = parse_bet9ja(payload, league)
-        if not fixtures:
-            return [], "No valid 1X2 fixtures parsed from this group"
-
-        return fixtures, "OK"
+        fixtures = parse_bet9ja(payload)
+        return (
+            fixtures,
+            "OK" if fixtures else "PARSER_FAILED: no recognized 1X2 fixtures",
+        )
 
     except httpx.TimeoutException:
-        return [], "Request timed out"
+        return [], "TIMEOUT"
     except httpx.HTTPError as exc:
-        return [], f"Network error: {type(exc).__name__}"
+        return [], f"NETWORK_ERROR: {type(exc).__name__}"
 
 
-async def fetch_all_feeds(client):
-    results = {}
+# -------------------- Optional browser-based odds collection --------------------
+
+async def fetch_browser_bookmaker(name, config):
+    """
+    Reads publicly rendered event cards using user-verified CSS selectors.
+
+    No CAPTCHA bypass, login bypass, or anti-bot circumvention.
+    Selectors are intentionally not guessed. Missing selectors mean
+    UNCONFIGURED rather than fabricated odds.
+    """
+    required = [
+        "event", "home", "away",
+        "home_odds", "draw_odds", "away_odds",
+    ]
+
+    if not PLAYWRIGHT_AVAILABLE:
+        return [], "UNAVAILABLE: Playwright is not installed"
+
+    if any(not config.get(key) for key in required):
+        return [], "UNCONFIGURED: verified CSS selectors are required"
+
     fixtures = []
 
-    sporty_fixtures, sporty_status = await fetch_sportybet(client)
-    results["SportyBet"] = {
-        "status": sporty_status,
-        "fixtures": len(sporty_fixtures),
-    }
-    fixtures.extend(sporty_fixtures)
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page(
+                user_agent=HEADERS["User-Agent"]
+            )
+            page.set_default_timeout(12000)
 
-    # Keep requests sequential to avoid unnecessary upstream load.
-    for league, group_id in BET9JA_GROUPS.items():
-        group_fixtures, status = await fetch_bet9ja_group(
-            client, league, group_id
+            response = await page.goto(
+                config["url"],
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+
+            if response is None:
+                await browser.close()
+                return [], "UNAVAILABLE: no page response"
+
+            if response.status >= 400:
+                status = f"HTTP {response.status}"
+                await browser.close()
+                return [], status
+
+            # Wait briefly for ordinary page rendering, without trying
+            # to defeat bot protection or restricted access.
+            await page.wait_for_timeout(1500)
+
+            cards = page.locator(config["event"])
+            count = min(await cards.count(), 100)
+
+            for i in range(count):
+                card = cards.nth(i)
+
+                async def read_text(selector):
+                    locator = card.locator(selector)
+                    if await locator.count() == 0:
+                        return None
+                    return (await locator.first.inner_text()).strip()
+
+                home = await read_text(config["home"])
+                away = await read_text(config["away"])
+                home_odds = await read_text(config["home_odds"])
+                draw_odds = await read_text(config["draw_odds"])
+                away_odds = await read_text(config["away_odds"])
+
+                league = None
+                if config.get("league"):
+                    league = await read_text(config["league"])
+
+                fixture = make_fixture(
+                    name,
+                    home,
+                    away,
+                    {
+                        "home": home_odds,
+                        "draw": draw_odds,
+                        "away": away_odds,
+                    },
+                    league=league or "",
+                )
+                if fixture:
+                    # Browser capture time is known, but bookmaker
+                    # price-update time is not. It is marked separately.
+                    fixture["price_updated_at"] = None
+                    fixture["source"] = "browser"
+                    fixtures.append(fixture)
+
+            await browser.close()
+
+        if not fixtures:
+            return [], (
+                "PARSER_FAILED: no valid events matched configured selectors"
+            )
+
+        return fixtures, (
+            "CAPTURED: visible odds found; bookmaker price timestamp "
+            "not verified"
         )
-        results[f"Bet9ja/{league}"] = {
+
+    except Exception as exc:
+        # Do not expose page content, credentials, or full URLs in logs.
+        return [], f"BROWSER_ERROR: {type(exc).__name__}"
+
+
+# -------------------- Feed orchestration --------------------
+
+async def fetch_all_feeds(client):
+    fixtures = []
+    statuses = {}
+
+    sporty, status = await fetch_sportybet(client)
+    fixtures.extend(sporty)
+    statuses["SportyBet"] = {
+        "status": status,
+        "fixtures": len(sporty),
+    }
+
+    bet9ja, status = await fetch_bet9ja(client)
+    fixtures.extend(bet9ja)
+    statuses["Bet9ja"] = {
+        "status": status,
+        "fixtures": len(bet9ja),
+    }
+
+    for name, config in BROWSER_SOURCES.items():
+        found, status = await fetch_browser_bookmaker(name, config)
+        fixtures.extend(found)
+        statuses[name] = {
             "status": status,
-            "fixtures": len(group_fixtures),
+            "fixtures": len(found),
         }
-        fixtures.extend(group_fixtures)
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.5)
 
-    return fixtures, results
+    return fixtures, statuses
 
 
-# -------------------- Matching and arbitrage math --------------------
-
-def kickoff_compatible(a, b):
-    ta = a.get("kickoff")
-    tb = b.get("kickoff")
-    if ta is None or tb is None:
-        # Missing kickoff is not enough evidence to reject a match,
-        # but team names and fixture orientation must still match.
-        return True
-    return abs(ta - tb) <= 3 * 60 * 60
-
+# -------------------- Fixture matching and calculations --------------------
 
 def same_fixture(a, b):
-    if not kickoff_compatible(a, b):
-        return False
-
-    direct = (
+    # A reversed home/away fixture is not the same 1X2 market.
+    same_teams = (
         names_match(a["home"], b["home"])
         and names_match(a["away"], b["away"])
     )
-    reversed_names = (
-        names_match(a["home"], b["away"])
-        and names_match(a["away"], b["home"])
-    )
+    if not same_teams:
+        return False
 
-    # Reversed home/away orientation is not the same 1X2 market.
-    return direct and not reversed_names
+    ka, kb = a.get("kickoff"), b.get("kickoff")
+    if ka is not None and kb is not None and abs(ka - kb) > 3 * 3600:
+        return False
+
+    return True
 
 
-def rounded_stakes(odds, bankroll):
-    """
-    Proportional dutching stakes rounded DOWN to the configured step.
-    Any leftover bankroll is left unallocated.
-    """
-    inv = {k: 1.0 / odds[k] for k in ("home", "draw", "away")}
-    total_inv = sum(inv.values())
+def price_is_fresh(event):
+    updated = event.get("price_updated_at")
+    if updated is None:
+        # Browser-rendered odds do not expose a verified update timestamp.
+        return event.get("source") != "browser"
 
-    if total_inv <= 0:
+    age = time.time() - updated
+    return 0 <= age <= MAX_PRICE_AGE
+
+
+def calculate_stakes(odds):
+    inverse = {k: 1 / odds[k] for k in ("home", "draw", "away")}
+    total_inverse = sum(inverse.values())
+
+    if total_inverse >= 1:
         return None
 
-    stakes = {}
-    for outcome in ("home", "draw", "away"):
-        raw = bankroll * inv[outcome] / total_inv
-        stakes[outcome] = int(raw / STAKE_STEP) * STAKE_STEP
+    stakes = {
+        k: int((BANKROLL * inverse[k] / total_inverse) / STAKE_STEP)
+        * STAKE_STEP
+        for k in inverse
+    }
 
-    if sum(stakes.values()) <= 0 or sum(stakes.values()) > bankroll:
+    if sum(stakes.values()) <= 0 or sum(stakes.values()) > BANKROLL:
         return None
 
     return stakes
 
 
-def evaluate_group(events):
-    """
-    Group events by matching fixture. Use the best available price for
-    each 1X2 outcome, preserving the bookmaker that offered it.
-    """
-    if len({e["bookmaker"] for e in events}) < 2:
+def evaluate_group(group):
+    if len({x["bookmaker"] for x in group}) < 2:
+        return None
+
+    # Reject stale or timestamp-unverified browser prices.
+    usable = [x for x in group if price_is_fresh(x)]
+    if len({x["bookmaker"] for x in usable}) < 2:
         return None
 
     best = {}
     for outcome in ("home", "draw", "away"):
-        candidates = [
-            e for e in events
-            if number(e["odds"].get(outcome))
+        choices = [
+            x for x in usable
+            if x["odds"].get(outcome) is not None
         ]
-        if not candidates:
+        if not choices:
             return None
-        best[outcome] = max(
-            candidates, key=lambda e: e["odds"][outcome]
-        )
+        best[outcome] = max(choices, key=lambda x: x["odds"][outcome])
 
-    # Ensure the three prices came from one consistently identified match.
     reference = best["home"]
-    if not all(same_fixture(reference, best[o]) for o in ("draw", "away")):
+    if not all(same_fixture(reference, best[k]) for k in ("draw", "away")):
         return None
 
-    # At least two different bookmakers must contribute.
-    contributing_books = {
-        best[o]["bookmaker"] for o in ("home", "draw", "away")
-    }
-    if len(contributing_books) < 2:
+    if len({best[k]["bookmaker"] for k in best}) < 2:
         return None
 
-    odds = {o: best[o]["odds"][o] for o in ("home", "draw", "away")}
-    implied_sum = sum(1.0 / odds[o] for o in odds)
-
-    if implied_sum >= 1.0:
+    odds = {k: best[k]["odds"][k] for k in best}
+    implied_sum = sum(1 / odds[k] for k in odds)
+    if implied_sum >= 1:
         return None
 
-    margin = ((1.0 / implied_sum) - 1.0) * 100.0
-    stakes = rounded_stakes(odds, BANKROLL)
+    margin = ((1 / implied_sum) - 1) * 100
+    stakes = calculate_stakes(odds)
     if not stakes:
         return None
 
     total_stake = sum(stakes.values())
-    returns = {
-        o: stakes[o] * odds[o] for o in odds
-    }
+    returns = {k: stakes[k] * odds[k] for k in stakes}
     worst_return = min(returns.values())
-    worst_profit = worst_return - total_stake
+    profit = worst_return - total_stake
 
-    # Validate after rounding, not merely from the theoretical formula.
-    if worst_profit < MIN_PROFIT_NGN:
-        return None
-    if margin < MIN_MARGIN_PERCENT:
+    if margin < MIN_MARGIN or profit < MIN_PROFIT:
         return None
 
     return {
         "home": reference["home"],
         "away": reference["away"],
         "league": reference.get("league", ""),
-        "kickoff": reference.get("kickoff"),
         "odds": odds,
-        "books": {o: best[o]["bookmaker"] for o in best},
+        "books": {k: best[k]["bookmaker"] for k in best},
         "stakes": stakes,
         "total_stake": total_stake,
         "worst_return": worst_return,
-        "worst_profit": worst_profit,
+        "worst_profit": profit,
         "margin_percent": margin,
-        "implied_sum": implied_sum,
     }
 
 
 def find_opportunities(fixtures):
-    # Build groups using conservative same-orientation fixture matching.
     groups = []
     for fixture in fixtures:
         matched = False
@@ -642,42 +691,107 @@ def find_opportunities(fixtures):
         if not matched:
             groups.append([fixture])
 
-    opportunities = []
+    results = []
     for group in groups:
         result = evaluate_group(group)
         if result:
-            opportunities.append(result)
+            results.append(result)
 
-    opportunities.sort(key=lambda x: x["worst_profit"], reverse=True)
-    return opportunities
+    return sorted(results, key=lambda x: x["worst_profit"], reverse=True)
 
 
-# -------------------- Telegram --------------------
+# -------------------- Recommendations --------------------
+
+def build_recommendations():
+    feeds = last_scan.get("feeds", {})
+    recommendations = []
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        recommendations.append(
+            "Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Render."
+        )
+
+    if not feeds:
+        recommendations.append(
+            "Run a scan and inspect /feed-status for source diagnostics."
+        )
+
+    for name, data in feeds.items():
+        status = data.get("status", "")
+        count = data.get("fixtures", 0)
+
+        if count:
+            recommendations.append(
+                f"{name}: collected {count} fixture records; "
+                "verify market and odds freshness before betting."
+            )
+        elif "UNCONFIGURED" in status:
+            recommendations.append(
+                f"{name}: configure and test its public-page CSS selectors "
+                "before enabling browser collection."
+            )
+        elif "UNAVAILABLE" in status or "HTTP " in status:
+            recommendations.append(
+                f"{name}: source is unavailable or returned an HTTP error; "
+                "do not treat it as a working odds feed."
+            )
+        elif "PARSER_FAILED" in status:
+            recommendations.append(
+                f"{name}: inspect the response schema or page selectors; "
+                "do not guess odds fields."
+            )
+        elif status:
+            recommendations.append(f"{name}: {status}.")
+
+    if sum(x.get("fixtures", 0) for x in feeds.values()) == 0:
+        recommendations.append(
+            "No usable fixtures were collected. No arbitrage alert is justified."
+        )
+
+    if not PLAYWRIGHT_AVAILABLE:
+        recommendations.append(
+            "Browser mode is disabled. Install Playwright and Chromium "
+            "before configuring 1xBet or Betway page selectors."
+        )
+
+    if not recommendations:
+        recommendations.append(
+            "Feeds returned fixture records. Continue checking actual prices, "
+            "settlement rules, betting limits, and rounded worst-case profit."
+        )
+
+    return recommendations
+
+
+# -------------------- Telegram alerts --------------------
 
 async def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram is not configured.")
+        log.warning("Telegram credentials are not configured.")
         return False
 
-    # Do not log the URL: it contains the secret bot token.
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True,
-    }
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.post(url, json=payload)
+            response = await client.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "disable_web_page_preview": True,
+                },
+            )
 
         if response.status_code != 200:
             log.warning("Telegram returned HTTP %s.", response.status_code)
             return False
 
-        data = response.json()
-        if not data.get("ok"):
-            log.warning("Telegram API did not confirm message delivery.")
+        if not response.json().get("ok"):
+            log.warning("Telegram did not confirm message delivery.")
             return False
 
         log.info("Telegram message delivered.")
@@ -688,58 +802,40 @@ async def send_telegram(message):
         return False
 
 
-def alert_key(opportunity):
-    # Use rounded odds as part of the key so a changed opportunity
-    # can alert again. This is in-memory deduplication only.
-    odds_part = tuple(
-        round(opportunity["odds"][k], 3)
-        for k in ("home", "draw", "away")
-    )
-    return (
-        clean_name(opportunity["home"]),
-        clean_name(opportunity["away"]),
-        odds_part,
-    )
-
-
-def format_alert(o):
-    kickoff = "Unknown"
-    if o.get("kickoff"):
-        kickoff = datetime.fromtimestamp(
-            o["kickoff"], tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M UTC")
-
+def opportunity_message(item):
     return (
         "⚽ SolveEase Arbitrage Candidate\n\n"
-        f"{o['home']} vs {o['away']}\n"
-        f"League: {o.get('league') or 'Unknown'}\n"
-        f"Kickoff: {kickoff}\n\n"
-        f"HOME: {o['odds']['home']:.2f} — {o['books']['home']}\n"
-        f"DRAW: {o['odds']['draw']:.2f} — {o['books']['draw']}\n"
-        f"AWAY: {o['odds']['away']:.2f} — {o['books']['away']}\n\n"
-        f"Stake HOME: ₦{o['stakes']['home']:,.0f}\n"
-        f"Stake DRAW: ₦{o['stakes']['draw']:,.0f}\n"
-        f"Stake AWAY: ₦{o['stakes']['away']:,.0f}\n"
-        f"Total stake: ₦{o['total_stake']:,.0f}\n"
-        f"Lowest calculated return: ₦{o['worst_return']:,.0f}\n"
-        f"Calculated worst-case profit: ₦{o['worst_profit']:,.0f}\n"
-        f"Theoretical margin: {o['margin_percent']:.2f}%\n\n"
-        "IMPORTANT: Candidate only. Recheck all three prices, market "
-        "rules, limits and availability directly with the bookmakers "
-        "before risking money. Odds can change or bets can be rejected."
+        f"{item['home']} vs {item['away']}\n"
+        f"League: {item.get('league') or 'Unknown'}\n\n"
+        f"HOME: {item['odds']['home']:.2f} — {item['books']['home']}\n"
+        f"DRAW: {item['odds']['draw']:.2f} — {item['books']['draw']}\n"
+        f"AWAY: {item['odds']['away']:.2f} — {item['books']['away']}\n\n"
+        f"Stake HOME: ₦{item['stakes']['home']:,.0f}\n"
+        f"Stake DRAW: ₦{item['stakes']['draw']:,.0f}\n"
+        f"Stake AWAY: ₦{item['stakes']['away']:,.0f}\n"
+        f"Total stake: ₦{item['total_stake']:,.0f}\n"
+        f"Lowest calculated return: ₦{item['worst_return']:,.0f}\n"
+        f"Calculated worst-case profit: ₦{item['worst_profit']:,.0f}\n"
+        f"Theoretical margin: {item['margin_percent']:.2f}%\n\n"
+        "Candidate only. Recheck prices and rules directly with each "
+        "bookmaker. Odds may change and bets may be rejected."
     )
 
 
-# -------------------- Scan cycle --------------------
+def opportunity_key(item):
+    return (
+        clean_name(item["home"]),
+        clean_name(item["away"]),
+        tuple(round(item["odds"][k], 3) for k in ("home", "draw", "away")),
+    )
+
+
+# -------------------- Scanner --------------------
 
 async def perform_scan():
-    global last_scan
-
     async with scan_lock:
-        started = datetime.now(timezone.utc).isoformat()
-        last_scan["started_at"] = started
+        last_scan["started_at"] = datetime.now(timezone.utc).isoformat()
         last_scan["error"] = None
-
         log.info("Starting bookmaker scan.")
 
         try:
@@ -747,7 +843,7 @@ async def perform_scan():
                 timeout=REQUEST_TIMEOUT,
                 headers=HEADERS,
             ) as client:
-                fixtures, feed_results = await fetch_all_feeds(client)
+                fixtures, statuses = await fetch_all_feeds(client)
 
             opportunities = find_opportunities(fixtures)
 
@@ -755,52 +851,36 @@ async def perform_scan():
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "fixtures": len(fixtures),
                 "opportunities": len(opportunities),
-                "feeds": feed_results,
-                "error": None,
+                "feeds": statuses,
             })
 
-            log.info(
-                "Collected %s usable fixture records from configured feeds.",
-                len(fixtures),
-            )
-
-            for name, result in feed_results.items():
+            for name, result in statuses.items():
                 log.info(
-                    "Feed %s: %s fixtures; status=%s",
-                    name, result["fixtures"], result["status"]
+                    "Feed %s: fixtures=%s status=%s",
+                    name, result["fixtures"], result["status"],
                 )
 
-            if not fixtures:
-                log.warning(
-                    "No usable 1X2 fixtures. No opportunities will be invented."
-                )
-                return last_scan
+            log.info("Collected %s usable fixture records.", len(fixtures))
+
+            for item in opportunities:
+                key = opportunity_key(item)
+                if key in sent_alert_keys:
+                    continue
+                if await send_telegram(opportunity_message(item)):
+                    sent_alert_keys.add(key)
+
+            if len(sent_alert_keys) > 1000:
+                sent_alert_keys.clear()
 
             if not opportunities:
                 log.info("No qualifying arbitrage opportunities found.")
-                return last_scan
-
-            log.info("Found %s qualifying candidates.", len(opportunities))
-
-            for opportunity in opportunities:
-                key = alert_key(opportunity)
-                if key in sent_alert_keys:
-                    continue
-
-                delivered = await send_telegram(format_alert(opportunity))
-                if delivered:
-                    sent_alert_keys.add(key)
-
-            # Bound memory usage.
-            if len(sent_alert_keys) > 1000:
-                sent_alert_keys.clear()
 
             return last_scan
 
         except Exception as exc:
             last_scan["error"] = type(exc).__name__
             last_scan["completed_at"] = datetime.now(timezone.utc).isoformat()
-            log.exception("Scan cycle failed.")
+            log.exception("Scan failed.")
             return last_scan
 
 
@@ -813,12 +893,7 @@ async def scan_loop():
         except Exception:
             log.exception("Unexpected scanner loop error.")
 
-        await asyncio.sleep(max(60, SCAN_INTERVAL))
-
-
-# -------------------- FastAPI / Render --------------------
-
-background_task = None
+        await asyncio.sleep(SCAN_INTERVAL)
 
 
 @asynccontextmanager
@@ -827,18 +902,14 @@ async def lifespan(app):
 
     log.info("SolveEase Arbitrage Engine starting.")
 
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram(
-            "✅ SolveEase Arbitrage Engine started.\n"
-            f"Bankroll setting: ₦{BANKROLL:,.0f}\n"
-            f"Scan interval: {SCAN_INTERVAL} seconds.\n"
-            "Startup does not confirm bookmaker feed availability."
-        )
-    else:
-        log.warning("Telegram credentials are not configured.")
+    await send_telegram(
+        "✅ SolveEase Arbitrage Engine started.\n"
+        f"Bankroll setting: ₦{BANKROLL:,.0f}\n"
+        f"Scan interval: {SCAN_INTERVAL} seconds.\n"
+        "Startup confirms service initialization only, not odds availability."
+    )
 
     background_task = asyncio.create_task(scan_loop())
-
     try:
         yield
     finally:
@@ -852,7 +923,7 @@ async def lifespan(app):
 
 app = FastAPI(
     title="SolveEase Arbitrage Engine",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -867,13 +938,25 @@ async def health_check():
         ),
         "bankroll": BANKROLL,
         "scan_interval_seconds": SCAN_INTERVAL,
-        "note": "Service health does not confirm bookmaker feed availability.",
+        "playwright_available": PLAYWRIGHT_AVAILABLE,
+        "note": "Online status does not prove odds feed availability.",
     }
 
 
 @app.get("/feed-status")
 async def feed_status():
     return last_scan
+
+
+@app.get("/recommendations")
+async def recommendations():
+    return {
+        "recommendations": build_recommendations(),
+        "next_action": (
+            "Review feed status, configure only verified selectors, "
+            "and confirm usable odds before relying on alerts."
+        ),
+    }
 
 
 @app.post("/scan-now")
