@@ -1,0 +1,27 @@
+name: Local Surebet Engine
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # Runs automatically every 15 minutes
+  workflow_dispatch: # Allows you to manually trigger it anytime from your GitHub Actions tab
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install httpx thefuzz
+
+      - name: Execute Odds Scanner Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
