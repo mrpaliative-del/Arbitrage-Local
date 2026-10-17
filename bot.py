@@ -1,6 +1,5 @@
 import os
 import asyncio
-import threading
 import httpx
 from fastapi import FastAPI
 import uvicorn
@@ -172,8 +171,10 @@ async def scan_loop():
             print(msg)
             await send_telegram_notification(msg)
 
-# --- BACKGROUND THREAD & FASTAPI SERVER ---
+# --- FASTAPI SERVER & ASYNC BACKGROUND SCHEDULER ---
 async def continuous_scanner():
+    # Wait 5 seconds after server start for port binding
+    await asyncio.sleep(5.0)
     while True:
         try:
             await scan_loop()
@@ -183,14 +184,10 @@ async def continuous_scanner():
         print("[*] Scan complete. Sleeping for 15 minutes...")
         await asyncio.sleep(900)  # Wait 15 minutes between scans
 
-def run_background_scanner():
-    asyncio.run(continuous_scanner())
-
 @app.on_event("startup")
-def startup_event():
-    # Spin off the arbitrage loop on a background thread when Render boots the container
-    scanner_thread = threading.Thread(target=run_background_scanner, daemon=True)
-    scanner_thread.start()
+async def startup_event():
+    # Safely schedule the background loop on the main event loop
+    asyncio.create_task(continuous_scanner())
 
 @app.get("/")
 def health_check():
